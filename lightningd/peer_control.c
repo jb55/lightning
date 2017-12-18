@@ -207,7 +207,7 @@ void peer_fail_permanent(struct peer *peer, const u8 *msg TAKES)
 		    peer_state_name(peer->state), why);
 
 	/* We can have multiple errors, eg. onchaind failures. */
-	if (!peer->error)
+	if (!peer_has_error(peer))
 		peer->error = towire_error(peer, &all_channels, msg);
 
 	peer_set_owner(peer, NULL);
@@ -584,7 +584,7 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 			  peer_state_name(peer->state));
 
 		/* FIXME: We can have errors for multiple channels. */
-		if (peer->error) {
+		if (peer_has_error(peer)) {
 			error = peer->error;
 			goto send_error;
 		}
