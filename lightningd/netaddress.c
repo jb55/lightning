@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <common/wireaddr.h>
+#include <ccan/tal/str/str.h>
 #include <errno.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
@@ -297,30 +298,81 @@ void guess_addresses(struct lightningd *ld)
         tal_resize(&ld->wireaddrs, n);
 }
 
-bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 port)
+bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport)
 {
 	struct in6_addr v6;
 	struct in_addr v4;
+	u16 port;
+	char *ip;
+	bool res;
+	tal_t *tmpctx = tal_tmpctx(NULL);
+
+	res = false;
+	port = defport;
+
+	if (!parse_ip_port(tmpctx, arg, &ip, &port))
+		port = defport;
 
 	/* FIXME: change arg to addr[:port] and use getaddrinfo? */
 	if (streq(arg, "localhost"))
-		arg = "127.0.0.1";
+		ip = "127.0.0.1";
 	else if (streq(arg, "ip6-localhost"))
-		arg = "::1";
+		ip = "::1";
 
 	memset(&addr->addr, 0, sizeof(addr->addr));
-	if (inet_pton(AF_INET, arg, &v4) == 1) {
+
+	if (inet_pton(AF_INET, ip, &v4) == 1) {
 		addr->type = ADDR_TYPE_IPV4;
 		addr->addrlen = 4;
 		addr->port = port;
 		memcpy(&addr->addr, &v4, addr->addrlen);
-		return true;
-	} else if (inet_pton(AF_INET6, arg, &v6) == 1) {
+		res = true;
+	} else if (inet_pton(AF_INET6, ip, &v6) == 1) {
 		addr->type = ADDR_TYPE_IPV6;
 		addr->addrlen = 16;
 		addr->port = port;
 		memcpy(&addr->addr, &v6, addr->addrlen);
-		return true;
+		res = true;
 	}
-	return false;
+
+	tal_free(tmpctx);
+	return res;
+}
+
+// NOTE: arg is assumed to be an ipv4/6 addr string with optional port
+bool parse_ip_port(tal_t *ctx, const char *arg, char **ip, u16 *port) {
+	const char *p;
+	bool ipv6, has_brackets, has_colon;
+
+	p = arg;
+	*port = 0;
+	ipv6 = 1;
+	has_brackets = 0;
+	has_colon = 0;
+
+	*ip = tal_strdup(ctx, arg);
+
+	// scan string, looking for specific markers. These are used to
+	// determine what type of ip address we have and if we have a port.
+	for (; *p != '\0'; ++p) {
+		if (*p == '.') ipv6 = 0;
+		if (*p == '[') has_brackets = 1;
+		if (*p == ':') has_colon = 1;
+	}
+
+	// we have an ip addr with no port
+	if ((ipv6 && !has_brackets) || (!ipv6 && !has_colon))
+		return false;
+
+	// we have a port, let's go to it
+	while (*--p != ':');
+
+	// chop off port
+	(*ip)[p - arg - ipv6] = '\0';
+
+	// skip over first [ if ipv6
+	if (ipv6) (*ip)++;
+
+	*port = atoi(p + 1);
+	return true;
 }
