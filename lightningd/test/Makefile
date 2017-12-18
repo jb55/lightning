@@ -14,6 +14,7 @@ LIGHTNINGD_TEST_COMMON_OBJS :=			\
 	common/msg_queue.o			\
 	common/utils.o				\
 	common/type_to_string.o			\
+	common/wireaddr.o			\
 	common/permute_tx.o
 
 update-mocks: $(LIGHTNINGD_TEST_SRC:%=update-mocks/%)
