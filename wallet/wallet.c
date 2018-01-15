@@ -1044,6 +1044,7 @@ static bool wallet_stmt2htlc_out(const struct wallet_channel *channel,
 
 	out->failuremsg = NULL;
 	out->failcode = 0;
+	out->cmd = NULL;
 
 	/* Need to defer wiring until we can look up all incoming
 	 * htlcs, will wire using origin_htlc_id */
