@@ -2536,6 +2536,116 @@ class LightningDTests(BaseLightningDTests):
         # L1 must notice.
         l1.daemon.wait_for_log('-> ONCHAIND_THEIR_UNILATERAL')
 
+    @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+    def test_payment_success_persistence(self):
+        # Start two nodes and open a channel.. die during payment.
+        l1 = self.node_factory.get_node(disconnect=['+WIRE_COMMITMENT_SIGNED'],
+                                        options=['--no-reconnect'])
+        l2 = self.node_factory.get_node()
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.info['port'])
+
+        chanid = self.fund_channel(l1, l2, 100000)
+
+        inv1 = l2.rpc.invoice(1000, 'inv1', 'inv1')
+
+        # Fire off a pay request, it'll get interrupted by a restart
+        fut = self.executor.submit(l1.rpc.pay, inv1['bolt11'])
+
+        l1.daemon.wait_for_log('dev_disconnect: \+WIRE_COMMITMENT_SIGNED')
+
+        print("Killing l1 in mid HTLC")
+        l1.daemon.proc.terminate()
+
+        # Restart l1, without disconnect stuff.
+        l1.daemon.cmd_line.remove('--no-reconnect')
+        l1.daemon.cmd_line.remove('--dev-disconnect=dev_disconnect')
+
+        # Should reconnect, and sort the payment out.
+        l1.daemon.start()
+
+        wait_for(lambda: l1.rpc.listpayments()[0]['status'] != 'pending')
+
+        assert l1.rpc.listpayments()[0]['status'] == 'complete'
+        assert l2.rpc.listinvoice('inv1')[0]['complete'] == True
+
+        # FIXME: We should re-add pre-announced routes on startup!
+        self.wait_for_routes(l1, [chanid])
+        
+        # A duplicate should succeed immediately (nop) and return correct preimage.
+        preimage = l1.rpc.pay(inv1['bolt11'])['preimage']
+        assert l1.rpc.dev_rhash(preimage)['rhash'] == inv1['rhash']
+
+
+    @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+    def test_payment_failed_persistence(self):
+        # Start two nodes and open a channel.. die during payment.
+        l1 = self.node_factory.get_node(disconnect=['+WIRE_COMMITMENT_SIGNED'],
+                                        options=['--no-reconnect'])
+        l2 = self.node_factory.get_node()
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.info['port'])
+
+        self.fund_channel(l1, l2, 100000)
+
+        # Expires almost immediately, so it will fail.
+        inv1 = l2.rpc.invoice(1000, 'inv1', 'inv1', 1)
+
+        # Fire off a pay request, it'll get interrupted by a restart
+        fut = self.executor.submit(l1.rpc.pay, inv1['bolt11'])
+
+        l1.daemon.wait_for_log('dev_disconnect: \+WIRE_COMMITMENT_SIGNED')
+
+        print("Killing l1 in mid HTLC")
+        l1.daemon.proc.terminate()
+
+        # Restart l1, without disconnect stuff.
+        l1.daemon.cmd_line.remove('--no-reconnect')
+        l1.daemon.cmd_line.remove('--dev-disconnect=dev_disconnect')
+
+        # Make sure invoice has expired.
+        time.sleep(1)
+
+        # Should reconnect, and fail the payment
+        l1.daemon.start()
+
+        wait_for(lambda: l1.rpc.listpayments()[0]['status'] != 'pending')
+
+        assert l2.rpc.listinvoice('inv1')[0]['complete'] == False
+        assert l1.rpc.listpayments()[0]['status'] == 'failed'
+
+        # Another attempt should also fail.
+        self.assertRaises(ValueError, l1.rpc.pay, inv1['bolt11'])
+        
+    @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+    def test_payment_duplicate_uncommitted(self):
+        # We want to test two payments at the same time, before we send commit
+        l1 = self.node_factory.get_node(disconnect=['=WIRE_UPDATE_ADD_HTLC-nocommit'])
+        l2 = self.node_factory.get_node()
+
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.info['port'])
+
+        self.fund_channel(l1, l2, 100000)
+
+        inv1 = l2.rpc.invoice(1000, 'inv1', 'inv1')
+
+        # Start first payment, but not yet in db.
+        fut = self.executor.submit(l1.rpc.pay, inv1['bolt11'])
+
+        # Make sure that's started...
+        l1.daemon.wait_for_log('dev_disconnect: =WIRE_UPDATE_ADD_HTLC-nocommit')
+
+        # We should see it in listpayments
+        assert l1.rpc.listpayments()[0]['status'] == 'pending'
+        assert l1.rpc.listpayments()[0]['payment_hash'] == inv1['rhash']
+
+        # Second one should fail.
+        self.assertRaises(ValueError, l1.rpc.pay, inv1['bolt11'])
+
+        # Now, let it commit.
+        l1.rpc.dev_reenable_commit(l2.info['id'])
+
+        # This should succeed.
+        fut.result(10)
+
     @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for --dev-broadcast-interval")
     def test_gossip_badsig(self):
         l1 = self.node_factory.get_node()

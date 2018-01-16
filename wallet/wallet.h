@@ -21,6 +21,7 @@ struct wallet {
 	struct db *db;
 	struct log *log;
 	struct ext_key *bip32_base;
+	struct list_head unstored_payments;
 };
 
 /* Possible states for tracked outputs in the database. Not sure yet
@@ -66,9 +67,7 @@ struct wallet_channel {
 /* Possible states for a wallet_payment. Payments start in
  * `PENDING`. Outgoing payments are set to `PAYMENT_COMPLETE` once we
  * get the preimage matching the rhash, or to
- * `PAYMENT_FAILED`. Incoming payments are set to `PAYMENT_COMPLETE`
- * once the matching invoice is marked as complete, or `FAILED`
- * otherwise.  */
+ * `PAYMENT_FAILED`. */
 /* /!\ This is a DB ENUM, please do not change the numbering of any
  * already defined elements (adding is ok) /!\ */
 enum wallet_payment_status {
@@ -77,19 +76,22 @@ enum wallet_payment_status {
 	PAYMENT_FAILED = 2
 };
 
-/* Incoming and outgoing payments. A simple persisted representation
- * of a payment we either initiated or received. This can be used by
- * a UI to display the balance history. We explicitly exclude
- * forwarded payments.
+/* Outgoing payments. A simple persisted representation
+ * of a payment we initiated. This can be used by
+ * a UI (alongside invoices) to display the balance history.
  */
 struct wallet_payment {
+	/* If it's in unstored_payments */
+	struct list_node list;
 	u64 id;
 	u32 timestamp;
-	bool incoming;
 	struct sha256 payment_hash;
 	enum wallet_payment_status status;
-	struct pubkey *destination;
-	u64 *msatoshi;
+	struct pubkey destination;
+	u64 msatoshi;
+	/* Iff PAYMENT_COMPLETE */
+	struct preimage *payment_preimage;
+	struct secret *path_secrets;
 };
 
 /**
@@ -410,12 +412,31 @@ struct htlc_stub *wallet_htlc_stubs(const tal_t *ctx, struct wallet *wallet,
 				    struct wallet_channel *chan);
 
 /**
- * wallet_payment_add - Record a new incoming/outgoing payment
+ * wallet_payment_setup - Remember this payment for later committing.
+ *
+ * Either wallet_payment_store() gets called to put in db once hout
+ * is ready to go (and frees @payment), or @payment is tal_free'd.
+ *
+ * @wallet: wallet we're going to store it in.
+ * @payment: the payment for later committing.
+ */
+void wallet_payment_setup(struct wallet *wallet, struct wallet_payment *payment);
+
+/**
+ * wallet_payment_store - Record a new incoming/outgoing payment
  *
  * Stores the payment in the database.
  */
-bool wallet_payment_add(struct wallet *wallet,
-			 struct wallet_payment *payment);
+void wallet_payment_store(struct wallet *wallet,
+			  const struct sha256 *payment_hash);
+
+/**
+ * wallet_payment_delete - Remove a payment
+ *
+ * Removes the payment from the database.
+ */
+void wallet_payment_delete(struct wallet *wallet,
+			   const struct sha256 *payment_hash);
 
 /**
  * wallet_payment_by_hash - Retrieve a specific payment
@@ -434,7 +455,17 @@ wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
  */
 void wallet_payment_set_status(struct wallet *wallet,
 				const struct sha256 *payment_hash,
-				const enum wallet_payment_status newstatus);
+			        const enum wallet_payment_status newstatus,
+			        const struct preimage *preimage);
+
+/**
+ * wallet_payment_get_secrets - Get the secrets array for a given `payment_hash`
+ *
+ * Returns a tal_array: can return NULL for old dbs.
+ */
+struct secret *wallet_payment_get_secrets(const tal_t *ctx,
+					  struct wallet *wallet,
+					  const struct sha256 *payment_hash);
 
 /**
  * wallet_payment_list - Retrieve a list of payments

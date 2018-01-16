@@ -1,6 +1,7 @@
 #include "wallet.h"
 
 #include <bitcoin/script.h>
+#include <ccan/structeq/structeq.h>
 #include <ccan/tal/str/str.h>
 #include <inttypes.h>
 #include <lightningd/invoice.h>
@@ -20,6 +21,7 @@ struct wallet *wallet_new(const tal_t *ctx, struct log *log)
 	wallet->db = db_setup(wallet, log);
 	wallet->log = log;
 	wallet->bip32_base = NULL;
+	list_head_init(&wallet->unstored_payments);
 	return wallet;
 }
 
@@ -1048,6 +1050,7 @@ static bool wallet_stmt2htlc_out(const struct wallet_channel *channel,
 
 	out->failuremsg = NULL;
 	out->failcode = 0;
+	out->cmd = NULL;
 
 	/* Need to defer wiring until we can look up all incoming
 	 * htlcs, will wire using origin_htlc_id */
@@ -1379,10 +1382,38 @@ struct htlc_stub *wallet_htlc_stubs(const tal_t *ctx, struct wallet *wallet,
 	return stubs;
 }
 
-bool wallet_payment_add(struct wallet *wallet,
-			struct wallet_payment *payment)
+static struct wallet_payment *
+find_unstored_payment(struct wallet *wallet, const struct sha256 *payment_hash)
+{
+	struct wallet_payment *i;
+
+	list_for_each(&wallet->unstored_payments, i, list) {
+		if (structeq(payment_hash, &i->payment_hash))
+			return i;
+	}
+	return NULL;
+}
+
+static void remove_unstored_payment(struct wallet_payment *payment)
+{
+	list_del(&payment->list);
+}
+
+void wallet_payment_setup(struct wallet *wallet, struct wallet_payment *payment)
+{
+	assert(!find_unstored_payment(wallet, &payment->payment_hash));
+
+	list_add_tail(&wallet->unstored_payments, &payment->list);
+	tal_add_destructor(payment, remove_unstored_payment);
+}
+
+void wallet_payment_store(struct wallet *wallet,
+			  const struct sha256 *payment_hash)
 {
 	sqlite3_stmt *stmt;
+	struct wallet_payment *payment;
+
+	payment = find_unstored_payment(wallet, payment_hash);
 
         /* Don't attempt to add the same payment twice */
 	assert(!payment->id);
@@ -1392,31 +1423,41 @@ bool wallet_payment_add(struct wallet *wallet,
 		"INSERT INTO payments ("
 		"  status,"
 		"  payment_hash,"
-		"  direction,"
 		"  destination,"
 		"  msatoshi,"
 		"  timestamp"
-		") VALUES (?, ?, ?, ?, ?, ?);");
+		") VALUES (?, ?, ?, ?, ?);");
 
 	sqlite3_bind_int(stmt, 1, payment->status);
 	sqlite3_bind_sha256(stmt, 2, &payment->payment_hash);
-	sqlite3_bind_int(stmt, 3, payment->incoming?DIRECTION_INCOMING:DIRECTION_OUTGOING);
-
-	if (payment->destination)
-		sqlite3_bind_pubkey(stmt, 4, payment->destination);
-	else
-		sqlite3_bind_null(stmt, 4);
-
-	if (payment->msatoshi)
-		sqlite3_bind_int64(stmt, 5, *payment->msatoshi);
-	else
-		sqlite3_bind_null(stmt, 5);
-
-	sqlite3_bind_int(stmt, 6, payment->timestamp);
+	sqlite3_bind_pubkey(stmt, 3, &payment->destination);
+	sqlite3_bind_int64(stmt, 4, payment->msatoshi);
+	sqlite3_bind_int(stmt, 5, payment->timestamp);
 
 	db_exec_prepared(wallet->db, stmt);
-	payment->id = sqlite3_last_insert_rowid(wallet->db->sql);
-	return true;
+
+	tal_free(payment);
+}
+
+void wallet_payment_delete(struct wallet *wallet,
+			   const struct sha256 *payment_hash)
+{
+	sqlite3_stmt *stmt;
+	struct wallet_payment *payment;
+
+	payment = find_unstored_payment(wallet, payment_hash);
+	if (payment) {
+		tal_free(payment);
+		return;
+	}
+
+	stmt = db_prepare(
+		wallet->db,
+		"DELETE FROM payments WHERE payment_hash = ?");
+
+	sqlite3_bind_sha256(stmt, 1, payment_hash);
+
+	db_exec_prepared(wallet->db, stmt);
 }
 
 static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
@@ -1425,24 +1466,20 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	struct wallet_payment *payment = tal(ctx, struct wallet_payment);
 	payment->id = sqlite3_column_int64(stmt, 0);
 	payment->status = sqlite3_column_int(stmt, 1);
-	payment->incoming = sqlite3_column_int(stmt, 2) == DIRECTION_INCOMING;
 
-	if (sqlite3_column_type(stmt, 3) != SQLITE_NULL) {
-		payment->destination = tal(payment, struct pubkey);
-		sqlite3_column_pubkey(stmt, 3, payment->destination);
-	} else {
-		payment->destination = NULL;
-	}
+	sqlite3_column_pubkey(stmt, 2, &payment->destination);
+	payment->msatoshi = sqlite3_column_int64(stmt, 3);
+	sqlite3_column_sha256(stmt, 4, &payment->payment_hash);
 
-	if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
-		payment->msatoshi = tal(payment, u64);
-		*payment->msatoshi = sqlite3_column_int64(stmt, 4);
-	} else {
-		payment->msatoshi = NULL;
-	}
-	sqlite3_column_sha256(stmt, 5, &payment->payment_hash);
+	payment->timestamp = sqlite3_column_int(stmt, 5);
+	if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+		payment->payment_preimage = tal(payment, struct preimage);
+		sqlite3_column_preimage(stmt, 6, payment->payment_preimage);
+	} else
+		payment->payment_preimage = NULL;
 
-	payment->timestamp = sqlite3_column_int(stmt, 6);
+	/* Can be NULL for old db! */
+	payment->path_secrets = sqlite3_column_secrets(payment, stmt, 7);
 	return payment;
 }
 
@@ -1451,11 +1488,17 @@ wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
 		       const struct sha256 *payment_hash)
 {
 	sqlite3_stmt *stmt;
-	struct wallet_payment *payment = NULL;
+	struct wallet_payment *payment;
+
+	/* Present the illusion that it's in the db... */
+	payment = find_unstored_payment(wallet, payment_hash);
+	if (payment)
+		return payment;
 
 	stmt = db_prepare(wallet->db,
-			  "SELECT id, status, direction, destination,"
-			  "msatoshi , payment_hash, timestamp "
+			  "SELECT id, status, destination,"
+			  "msatoshi, payment_hash, timestamp, payment_preimage, "
+			  "path_secrets "
 			  "FROM payments "
 			  "WHERE payment_hash = ?");
 
@@ -1467,11 +1510,41 @@ wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
 	return payment;
 }
 
-void wallet_payment_set_status(struct wallet *wallet,
-			       const struct sha256 *payment_hash,
-			       const enum wallet_payment_status newstatus)
+struct secret *wallet_payment_get_secrets(const tal_t *ctx,
+					  struct wallet *wallet,
+					  const struct sha256 *payment_hash)
 {
 	sqlite3_stmt *stmt;
+	struct secret *path_secrets = NULL;
+
+	stmt = db_prepare(wallet->db,
+			  "SELECT path_secrets "
+			  "FROM payments "
+			  "WHERE payment_hash = ?");
+
+	sqlite3_bind_sha256(stmt, 1, payment_hash);
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		path_secrets = sqlite3_column_secrets(ctx, stmt, 0);
+	}
+	sqlite3_finalize(stmt);
+	return path_secrets;
+}
+
+void wallet_payment_set_status(struct wallet *wallet,
+			       const struct sha256 *payment_hash,
+			       const enum wallet_payment_status newstatus,
+			       const struct preimage *preimage)
+{
+	sqlite3_stmt *stmt;
+	struct wallet_payment *payment;
+
+	/* We can only fail an unstored payment! */
+	payment = find_unstored_payment(wallet, payment_hash);
+	if (payment) {
+		assert(newstatus == PAYMENT_FAILED);
+		tal_free(payment);
+		return;
+	}
 
 	stmt = db_prepare(wallet->db,
 			  "UPDATE payments SET status=? "
@@ -1480,6 +1553,16 @@ void wallet_payment_set_status(struct wallet *wallet,
 	sqlite3_bind_int(stmt, 1, newstatus);
 	sqlite3_bind_sha256(stmt, 2, payment_hash);
 	db_exec_prepared(wallet->db, stmt);
+
+	if (preimage) {
+		stmt = db_prepare(wallet->db,
+				  "UPDATE payments SET payment_preimage=? "
+				  "WHERE payment_hash=?");
+
+		sqlite3_bind_preimage(stmt, 1, preimage);
+		sqlite3_bind_sha256(stmt, 2, payment_hash);
+		db_exec_prepared(wallet->db, stmt);
+	}
 }
 
 const struct wallet_payment **wallet_payment_list(const tal_t *ctx,
@@ -1487,20 +1570,29 @@ const struct wallet_payment **wallet_payment_list(const tal_t *ctx,
 {
 	const struct wallet_payment **payments;
 	sqlite3_stmt *stmt;
+	struct wallet_payment *p;
+	size_t i;
 
 	payments = tal_arr(ctx, const struct wallet_payment *, 0);
 	stmt = db_prepare(
 		wallet->db,
-		"SELECT id, status, direction, destination, "
-		"msatoshi , payment_hash, timestamp "
+		"SELECT id, status, destination, "
+		"msatoshi, payment_hash, timestamp, payment_preimage, "
+		"path_secrets "
 		"FROM payments;");
 
-	for (int i = 0; sqlite3_step(stmt) == SQLITE_ROW; i++) {
+	for (i = 0; sqlite3_step(stmt) == SQLITE_ROW; i++) {
 		tal_resize(&payments, i+1);
 		payments[i] = wallet_stmt2payment(payments, stmt);
 	}
 
 	sqlite3_finalize(stmt);
+
+	/* Now attach payments not yet in db. */
+	list_for_each(&wallet->unstored_payments, p, list) {
+		tal_resize(&payments, i+1);
+		payments[i++] = p;
+	}
 
 	return payments;
 }

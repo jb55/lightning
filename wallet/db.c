@@ -157,6 +157,26 @@ char *dbmigrations[] = {
     /* Normally impossible, so at least we'll know if databases are ancient. */
     "UPDATE invoices SET msatoshi_received=0 WHERE state=1;",
     "ALTER TABLE channels ADD COLUMN last_was_revoke INTEGER;",
+    /* We no longer record incoming payments: invoices cover that.
+     * Without ALTER_TABLE DROP COLUMN support we need to do this by
+     * rename & copy, which works because there are no triggers etc. */
+    "ALTER TABLE payments RENAME TO temp_payments;",
+    "CREATE TABLE payments ("
+    "  id INTEGER,"
+    "  timestamp INTEGER,"
+    "  status INTEGER,"
+    "  payment_hash BLOB,"
+    "  destination BLOB,"
+    "  msatoshi INTEGER,"
+    "  PRIMARY KEY (id),"
+    "  UNIQUE (payment_hash)"
+    ");",
+    "INSERT INTO payments SELECT id, timestamp, status, payment_hash, destination, msatoshi FROM temp_payments WHERE direction=1;",
+    "DROP TABLE temp_payments;",
+    /* We need to keep the preimage in case they ask to pay again. */
+    "ALTER TABLE payments ADD COLUMN payment_preimage BLOB;",
+    /* We need to keep the shared secrets to decode error returns. */
+    "ALTER TABLE payments ADD COLUMN path_secrets BLOB;",
     NULL,
 };
 
@@ -505,6 +525,20 @@ bool sqlite3_column_sha256_double(sqlite3_stmt *stmt, int col,  struct sha256_do
 {
 	assert(sqlite3_column_bytes(stmt, col) == sizeof(struct sha256_double));
 	return memcpy(dest, sqlite3_column_blob(stmt, col), sizeof(struct sha256_double));
+}
+
+struct secret *sqlite3_column_secrets(const tal_t *ctx,
+				      sqlite3_stmt *stmt, int col)
+{
+	struct secret *secrets;
+	size_t n = sqlite3_column_bytes(stmt, col) / sizeof(*secrets);
+
+	/* Must fit exactly */
+	assert(n * sizeof(struct secret) == sqlite3_column_bytes(stmt, col));
+	if (n == 0)
+		return NULL;
+	secrets = tal_arr(ctx, struct secret, n);
+	return memcpy(secrets, sqlite3_column_blob(stmt, col), tal_len(secrets));
 }
 
 bool sqlite3_bind_sha256_double(sqlite3_stmt *stmt, int col, const struct sha256_double *p)
