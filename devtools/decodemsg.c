@@ -19,7 +19,7 @@ int main(int argc, char *argv[])
 			   "Decode an error message instead of a peer message");
 	opt_register_arg("--tlv", opt_set_charp, opt_show_charp,
 			&tlv_name,
-			"Deocde a TLV of this type instead of a peer message");
+			"Decode a TLV of this type instead of a peer message");
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "[<hexmsg>]"
 			   "Decode a lightning spec wire message from hex, or a series of messages from stdin",
