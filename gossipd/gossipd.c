@@ -166,6 +166,9 @@ struct peer {
 	bool scid_query_outstanding;
 	bool scid_query_was_internal;
 
+	/* How many query responses are we expecting? */
+	size_t num_scid_queries_outstanding;
+
 	/* How many pongs are we expecting? */
 	size_t num_pings_outstanding;
 
@@ -1797,6 +1800,7 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 	peer->scid_query_outstanding = false;
 	peer->query_channel_blocks = NULL;
 	peer->num_pings_outstanding = 0;
+
 	peer->gossip_level = peer_gossip_level(daemon,
 					       peer->gossip_queries_feature);
 

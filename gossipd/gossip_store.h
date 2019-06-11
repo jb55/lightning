@@ -34,6 +34,11 @@ bool gossip_store_load(struct routing_state *rstate, struct gossip_store *gs);
 u64 gossip_store_add_private_update(struct gossip_store *gs, const u8 *update);
 
 /**
+ * Add a private channel_update message to the gossip_store
+ */
+u64 gossip_store_add_private_update(struct gossip_store *gs, const u8 *update);
+
+/**
  * Add a gossip message to the gossip_store (and optional addendum)
  */
 u64 gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg,
